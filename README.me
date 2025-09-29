@@ -1,1 +1,1724 @@
+# Spark Lambda Architecture for Real‑Time Payments — Code & Report
+
+> **Mục tiêu**: Xây dựng hệ thống phân tích giao dịch thanh toán theo kiến trúc **Lambda** (Batch + Streaming) trên **Kubernetes**, sử dụng **Apache Spark**, **Kafka**, **HDFS (hoặc S3/HDFS‑equivalent)**, **NoSQL (Cassandra)**, đáp ứng các yêu cầu về xử lý phức tạp, tối ưu hiệu năng, exactly‑once, ML/Graph/Time‑series, giám sát & vận hành.
+
+---
+
+## I. Problem Definition
+
+### 1. Bài toán được chọn
+
+* **Real‑time Payments Observability & Fraud/Anomaly Detection**: thu thập sự kiện thanh toán (authorization, capture, refund…), chuẩn hóa, phát hiện bất thường theo thời gian thực, tổng hợp theo lô để phục vụ BI/analytics, huấn luyện mô hình rủi ro, và phân tích đồ thị quan hệ người dùng‑thiết bị‑merchant để phát hiện ring fraud.
+
+### 2. Vì sao phù hợp Big Data
+
+* **Tốc độ**: hàng chục‑trăm nghìn sự kiện/giây.
+* **Đa dạng**: nhiều nguồn (app, web, POS, gateway), nhiều schema.
+* **Khối lượng**: TB‑PB dữ liệu lịch sử cần lưu trữ & tổng hợp.
+
+### 3. Phạm vi & giới hạn
+
+* Phạm vi: pipeline ingestion → chuẩn hóa → streaming analytics + stateful processing → lưu HDFS/Cassandra → batch ETL nâng cao → ML/Graph/Timeseries.
+* Giới hạn: cấu hình bảo mật nâng cao (Kerberos, mTLS) để ở mức **template**/placeholder; có thể mở rộng trong triển khai thực tế.
+
+---
+
+## II. Architecture & Design
+
+### 1. Kiến trúc tổng thể: **Lambda Architecture**
+
+```mermaid
+flowchart LR
+  subgraph Ingestion
+    A[FastAPI Ingestion Service] -->|validate & enqueue| K[(Kafka)]
+  end
+
+  subgraph SpeedLayer
+    K --> S1[Spark Structured Streaming\n(streaming_transactions.py)]
+    S1 --> H[HDFS/Parquet+Checkpoint]
+    S1 --> C[(Cassandra NoSQL)]
+    S1 --> Mtr[Metrics/Prometheus]
+  end
+
+  subgraph BatchLayer
+    H --> B1[Batch ETL \n(batch_transformations.py)]
+    B1 --> Curated[Curated Parquet/Bucketed]
+    Curated --> ML[MLlib Training \n(train_risk_model.py)]
+    Curated --> Gf[GraphFrames \n(fraud_graph.py)]
+    Curated --> TS[Time‑series \n(ts_aggregations.py)]
+  end
+
+  subgraph ServingLayer
+    C --> APIread[Read API/Dashboards]
+    Curated --> BI[BI/SQL/Presto]
+  end
+
+  subgraph Ops
+    Mtr --> Graf[Grafana]
+    Logs[EFK/Loki] -.-> Ops
+  end
+```
+
+### 2. Thành phần & vai trò
+
+* **FastAPI**: cổng ingestion HTTP để nhận sự kiện, kiểm tra schema/chữ ký, đẩy vào Kafka.
+* **Kafka**: hàng đợi thông điệp, phân vùng theo `merchant_id`/`user_id`.
+* **Spark Structured Streaming**: xử lý real‑time, watermark, window, stateful, exactly‑once.
+* **HDFS**: lưu raw/bronze, silver, curated (parquet, partitioned, bucketed).
+* **Cassandra**: bảng tra cứu OLTP/serving aggregates (idempotent upsert).
+* **Spark Batch**: ETL phức tạp, join/udf/pivot/unpivot, tối ưu hoá.
+* **MLlib / GraphFrames / Time‑series**: advanced analytics.
+* **Kubernetes**: triển khai, autoscale, RBAC, Service, Ingress.
+* **Giám sát**: Prometheus + Grafana; log aggregation (Loki/EFK).
+
+### 3. Data Flow & Interaction
+
+* Ingestion API → Kafka(`payments.events`) → Spark Streaming (parse, dedup, watermark) → HDFS + Cassandra (serving)
+* Batch jobs đọc bronze/silver → transform nâng cao → curated → ML/Graph/TS
+* Mô hình/đồ thị xuất sang serving hoặc cảnh báo.
+
+---
+
+## III. Implementation Details (Code & Config)
+
+> Repo ảo (tham khảo cấu trúc thư mục). Toàn bộ **mã nguồn** minh hoạ bên dưới có chú thích đầy đủ và sử dụng **PySpark**.
+
+```
+spark-payments/
+├─ README.md                     # (Chính là tài liệu này)
+├─ ingestion/
+│  ├─ api/
+│  │  ├─ main.py                 # FastAPI service
+│  │  ├─ requirements.txt
+│  │  └─ Dockerfile
+│  └─ producers/
+│     └─ kafka_producer.py
+├─ spark/
+│  ├─ common/
+│  │  ├─ schemas.py
+│  │  └─ utils.py
+│  ├─ streaming/
+│  │  └─ streaming_transactions.py
+│  ├─ batch/
+│  │  └─ batch_transformations.py
+│  ├─ ml/
+│  │  └─ train_risk_model.py
+│  ├─ graph/
+│  │  └─ fraud_graph.py
+│  ├─ timeseries/
+│  │  └─ ts_aggregations.py
+│  └─ conf/
+│     └─ spark-defaults.conf
+├─ great_expectations/
+│  └─ ge_check.py
+├─ k8s/
+│  ├─ spark-operator/
+│  │  └─ spark-operator.yaml
+│  ├─ spark-apps/
+│  │  ├─ streaming-transactions.yaml
+│  │  ├─ batch-transformations.yaml
+│  │  └─ ml-train.yaml
+│  ├─ kafka/
+│  │  ├─ strimzi-operator.yaml
+│  │  ├─ kafka-cluster.yaml
+│  │  └─ topics.yaml
+│  ├─ cassandra/
+│  │  └─ cassandra-statefulset.yaml
+│  ├─ hdfs/
+│  │  ├─ namenode-statefulset.yaml
+│  │  └─ datanode-statefulset.yaml
+│  ├─ monitoring/
+│  │  ├─ prometheus.yaml
+│  │  ├─ grafana.yaml
+│  │  └─ servicemonitors.yaml
+│  └─ api/
+│     └─ ingestion-api.yaml
+├─ config/
+│  ├─ application.yaml
+│  └─ .env.example
+├─ tests/
+│  └─ test_spark_jobs.py
+└─ LICENSE
+```
+
+### 1) Ingestion API (FastAPI → Kafka)
+
+**ingestion/api/main.py**
+
+```python
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from typing import Optional
+from kafka import KafkaProducer
+import json, os, time
+
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "payments.events")
+
+producer = KafkaProducer(
+    bootstrap_servers=KAFKA_BOOTSTRAP,
+    value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+    acks="all",               # idempotent producer
+    enable_idempotence=True,
+    linger_ms=5,
+)
+
+app = FastAPI(title="Ingestion API")
+
+class PaymentEvent(BaseModel):
+    event_id: str
+    ts_ms: int = Field(..., description="event time in milliseconds")
+    user_id: str
+    merchant_id: str
+    amount: float
+    currency: str = "USD"
+    country: Optional[str] = None
+    device_id: Optional[str] = None
+    status: str = Field(..., regex="^(authorized|captured|refunded|failed)$")
+    metadata: Optional[dict] = {}
+
+@app.post("/ingest")
+def ingest(evt: PaymentEvent):
+    try:
+        # simple idempotency key (event_id) can be used by downstream sink
+        payload = evt.dict()
+        payload["ingest_received_ms"] = int(time.time() * 1000)
+        producer.send(KAFKA_TOPIC, value=payload, key=evt.event_id.encode("utf-8"))
+        producer.flush()
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+```
+
+**ingestion/api/requirements.txt**
+
+```
+fastapi==0.115.*
+uvicorn==0.30.*
+kafka-python==2.0.*
+pydantic==2.*
+```
+
+**ingestion/api/Dockerfile** (build image cho K8s, không khuyến khích chạy Docker standalone)
+
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY main.py .
+EXPOSE 8080
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+```
+
+**ingestion/producers/kafka_producer.py** (producer CLI mẫu)
+
+```python
+import json, time, uuid, random, os
+from kafka import KafkaProducer
+
+producer = KafkaProducer(
+    bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP", "kafka:9092"),
+    value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+    acks="all",
+    enable_idempotence=True,
+)
+
+def gen_event():
+    return {
+        "event_id": str(uuid.uuid4()),
+        "ts_ms": int(time.time() * 1000),
+        "user_id": f"u_{random.randint(1, 10_000)}",
+        "merchant_id": f"m_{random.randint(1, 500)}",
+        "amount": round(random.uniform(1, 500), 2),
+        "currency": "USD",
+        "country": random.choice(["VN","SG","ID","MY","TH","PH","US"]),
+        "device_id": f"d_{random.randint(1, 50_000)}",
+        "status": random.choice(["authorized","captured","failed"]),
+        "metadata": {"channel": random.choice(["app","web","pos"])},
+    }
+
+if __name__ == "__main__":
+    topic = os.getenv("KAFKA_TOPIC", "payments.events")
+    while True:
+        evt = gen_event()
+        producer.send(topic, value=evt, key=evt["event_id"].encode("utf-8"))
+        time.sleep(0.05)
+```
+
+---
+
+### 2) Spark Common (Schema + Utils)
+
+**spark/common/schemas.py**
+
+```python
+from pyspark.sql.types import (
+    StructType, StructField, StringType, LongType, DoubleType, MapType
+)
+
+payment_event_schema = StructType([
+    StructField("event_id", StringType(), False),
+    StructField("ts_ms", LongType(), False),
+    StructField("user_id", StringType(), False),
+    StructField("merchant_id", StringType(), False),
+    StructField("amount", DoubleType(), False),
+    StructField("currency", StringType(), True),
+    StructField("country", StringType(), True),
+    StructField("device_id", StringType(), True),
+    StructField("status", StringType(), False),
+    StructField("metadata", MapType(StringType(), StringType()), True),
+    StructField("ingest_received_ms", LongType(), True),
+])
+```
+
+**spark/common/utils.py**
+
+```python
+from pyspark.sql import DataFrame
+from pyspark.sql.functions import col
+
+# Simple utility to enforce positive amounts and currency upper-case
+from pyspark.sql.functions import upper, abs as f_abs
+
+def cleanse_payments(df: DataFrame) -> DataFrame:
+    return (
+        df.withColumn("amount", f_abs(col("amount")))
+          .withColumn("currency", upper(col("currency")))
+    )
+```
+
+---
+
+### 3) Spark Streaming (Exactly‑once, Watermark, Stateful)
+
+**spark/streaming/streaming_transactions.py**
+
+```python
+import os
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import (
+    col, from_json, to_timestamp, window, expr, when, approx_count_distinct,
+    substring, lit
+)
+from pyspark.sql.types import TimestampType
+from pyspark.sql.streaming import GroupState, GroupStateTimeout
+from common.schemas import payment_event_schema
+from common.utils import cleanse_payments
+
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "kafka:9092")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "payments.events")
+CHECKPOINT = os.getenv("CHECKPOINT", "hdfs://namenode:8020/checkpoints/streaming_tx")
+OUT_BRONZE = os.getenv("OUT_BRONZE", "hdfs://namenode:8020/bronze/payments/")
+OUT_CASSANDRA_KEYSPACE = os.getenv("CS_KEYSPACE", "payments")
+OUT_CASSANDRA_TABLE = os.getenv("CS_TABLE", "agg_5m_by_merchant")
+
+spark = (SparkSession.builder
+    .appName("streaming-transactions")
+    .config("spark.sql.shuffle.partitions", os.getenv("SHUFFLE", "200"))
+    .config("spark.sql.streaming.stateStore.providerClass", "org.apache.spark.sql.execution.streaming.state.RocksDBStateStoreProvider")
+    .getOrCreate())
+
+spark.sparkContext.setLogLevel("WARN")
+
+# 1) Read from Kafka (Structured Streaming)
+df_raw = (spark
+    .readStream
+    .format("kafka")
+    .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP)
+    .option("subscribe", KAFKA_TOPIC)
+    .option("startingOffsets", "latest")
+    .option("failOnDataLoss", "false")
+    .load())
+
+parsed = (df_raw
+    .selectExpr("CAST(value AS STRING) AS json", "timestamp")
+    .select(from_json(col("json"), payment_event_schema).alias("e"), col("timestamp").alias("ingest_ts"))
+    .select("e.*", "ingest_ts"))
+
+# 2) Cleanse + event time
+enriched = (cleanse_payments(parsed)
+    .withColumn("event_time", to_timestamp((col("ts_ms")/1000).cast("timestamp")))
+    .withWatermark("event_time", "20 minutes"))  # watermark for late data
+
+# 3) Dedup exactly-once at event level (idempotent write downstream by primary key)
+# Use last status by event_id if duplicates arrive
+from pyspark.sql.window import Window
+from pyspark.sql.functions import row_number
+
+w = Window.partitionBy("event_id").orderBy(col("event_time").desc())
+unique_events = (enriched
+    .withColumn("rn", row_number().over(w))
+    .filter(col("rn") == 1)
+    .drop("rn"))
+
+# 4) Write raw bronze to HDFS with checkpoint (append is exactly-once per batch given checkpoint)
+bronze_query = (unique_events
+    .writeStream
+    .format("parquet")
+    .option("path", OUT_BRONZE)
+    .option("checkpointLocation", f"{CHECKPOINT}/bronze")
+    .outputMode("append")
+    .start())
+
+# 5) Aggregations: 5‑minute sliding windows per merchant/status
+agg5m = (unique_events
+    .groupBy(
+        window(col("event_time"), "5 minutes", "1 minute"),
+        col("merchant_id"),
+        col("status")
+    )
+    .agg(
+        expr("count(*) as cnt"),
+        expr("sum(amount) as sum_amount"),
+        approx_count_distinct("user_id").alias("n_users")
+    )
+    .withColumn("window_start", col("window.start"))
+    .withColumn("window_end", col("window.end"))
+    .drop("window"))
+
+# 6) Stateful example: track rolling failure rate per merchant
+from pyspark.sql.functions import struct
+
+state_schema = "merchant_id string, total long, failed long, failure_rate double"
+
+def update_state(merchant_id, rows, state: GroupState):
+    total = state.get("total") if state.exists else 0
+    failed = state.get("failed") if state.exists else 0
+    for r in rows:
+        total += 1
+        if r.status == "failed":
+            failed += 1
+    fr = (failed / total) if total else 0.0
+    state.update({"total": total, "failed": failed})
+    return (merchant_id, total, failed, fr)
+
+from pyspark.sql.functions import expr as sql_expr
+
+stream_for_state = unique_events.select("merchant_id", "status", "event_time").withWatermark("event_time", "20 minutes")
+
+stateful = (stream_for_state
+    .groupByKey(lambda r: r.merchant_id)
+    .mapGroupsWithState(update_state, outputMode="update", timeoutConf=GroupStateTimeout.ProcessingTimeTimeout()))
+
+# 7) Sink aggregates to Cassandra (idempotent on composite primary key)
+
+def write_cassandra(batch_df, batch_id: int):
+    (batch_df
+        .write
+        .format("org.apache.spark.sql.cassandra")
+        .mode("append")
+        .options(table=OUT_CASSANDRA_TABLE, keyspace=OUT_CASSANDRA_KEYSPACE)
+        .save())
+
+cass_query = (agg5m
+    .writeStream
+    .foreachBatch(write_cassandra)  # exactly-once with idempotent primary key
+    .outputMode("update")
+    .option("checkpointLocation", f"{CHECKPOINT}/agg5m")
+    .start())
+
+spark.streams.awaitAnyTermination()
+```
+
+**Ghi chú**:
+
+* **Watermark** xử lý dữ liệu đến muộn.
+* **Exactly-once**: checkpoint + idempotent sink (Cassandra upsert theo primary key window_start, merchant_id, status).
+* **State management**: `mapGroupsWithState` cập nhật tỷ lệ lỗi.
+
+---
+
+### 4) Spark Batch (Aggregations, Pivot/Unpivot, UDF, Joins, Optimization)
+
+**spark/batch/batch_transformations.py**
+
+```python
+import os
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, sum as f_sum, countDistinct, expr, when, avg, regexp_replace
+from pyspark.sql.window import Window
+
+BRONZE = os.getenv("BRONZE", "hdfs://namenode:8020/bronze/payments/")
+CURATED = os.getenv("CURATED", "hdfs://namenode:8020/curated/payments/")
+DIM_PATH = os.getenv("DIM", "hdfs://namenode:8020/dim/")
+
+spark = (SparkSession.builder
+    .appName("batch-transformations")
+    .config("spark.sql.shuffle.partitions", os.getenv("SHUFFLE", "200"))
+    .getOrCreate())
+
+spark.sparkContext.setLogLevel("WARN")
+
+raw = spark.read.parquet(BRONZE)
+
+# Custom UDF: risk tag (demonstration) — prefer pandas UDF for perf
+from pyspark.sql.types import StringType
+from pyspark.sql.functions import udf
+
+@udf(StringType())
+def risk_bucket(amount: float, status: str) -> str:
+    if status == "failed":
+        return "risk_high" if amount >= 100 else "risk_med"
+    return "risk_low"
+
+df = raw.withColumn("risk_bucket", risk_bucket(col("amount"), col("status")))
+
+# Join with dimensions (broadcast for small dim)
+merchant_dim = spark.read.parquet(f"{DIM_PATH}/merchants/")
+user_dim = spark.read.parquet(f"{DIM_PATH}/users/")
+
+df = (df
+    .join(merchant_dim.hint("broadcast"), "merchant_id", "left")
+    .join(user_dim, "user_id", "left"))
+
+# Window functions: rolling daily amount per user
+from pyspark.sql.functions import to_date
+w = Window.partitionBy("user_id").orderBy("event_time").rowsBetween(-10, 0)
+
+df = df.withColumn("rolling_amt_10", expr("sum(amount) over w")).withColumn("event_date", to_date("event_time"))
+
+# Advanced aggregation with pivot
+agg = (df.groupBy("event_date", "merchant_id")
+    .pivot("status", ["authorized", "captured", "failed"])  # pivot on status
+    .agg(f_sum("amount").alias("sum_amt")))
+
+# Unpivot (stack) back to long format
+unpivot_cols = ["authorized_sum_amt", "captured_sum_amt", "failed_sum_amt"]
+unpivot_expr = "stack(3, 'authorized', authorized_sum_amt, 'captured', captured_sum_amt, 'failed', failed_sum_amt) as (status, sum_amt)"
+
+unpivoted = (agg.select("event_date", "merchant_id", *unpivot_cols)
+             .selectExpr("event_date", "merchant_id", unpivot_expr))
+
+# Bucketing for future sort-merge joins
+(unpivoted
+ .repartition(200)
+ .write
+ .format("parquet")
+ .mode("overwrite")
+ .bucketBy(64, "merchant_id")
+ .sortBy("merchant_id")
+ .saveAsTable("curated_payments_bucketed"))
+
+# Cache strategic & explain
+unpivoted.cache()
+print(unpivoted.explain(True))
+
+# Output curated
+(unpivoted
+ .write.mode("overwrite")
+ .partitionBy("event_date")
+ .parquet(CURATED))
+```
+
+**Điểm nhấn**: UDF, broadcast join, window, pivot/unpivot, bucketing, caching, `explain()`.
+
+---
+
+### 5) MLlib (Pipeline, CV, Metrics)
+
+**spark/ml/train_risk_model.py**
+
+```python
+import os
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, when
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import StringIndexer, OneHotEncoder, VectorAssembler, StandardScaler
+from pyspark.ml.classification import LogisticRegression
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+
+CURATED = os.getenv("CURATED", "hdfs://namenode:8020/curated/payments/")
+MODEL_DIR = os.getenv("MODEL_DIR", "hdfs://namenode:8020/models/risk_lr/")
+
+spark = SparkSession.builder.appName("train-risk-model").getOrCreate()
+
+# Load curated data (long format)
+df = spark.read.parquet(CURATED)
+
+# Label: bất thường khi sum_amt lớn nhưng status=failed (minh hoạ)
+df = df.withColumn("label", when((col("status") == "failed") & (col("sum_amt") > 50), 1.0).otherwise(0.0))
+
+cat_cols = ["status"]
+num_cols = ["sum_amt"]
+
+indexers = [StringIndexer(inputCol=c, outputCol=f"{c}_idx", handleInvalid="keep") for c in cat_cols]
+encoders = [OneHotEncoder(inputCols=[f"{c}_idx"], outputCols=[f"{c}_oh"]) for c in cat_cols]
+
+assembler = VectorAssembler(inputCols=["sum_amt", "status_oh"], outputCol="features_raw")
+scaler = StandardScaler(inputCol="features_raw", outputCol="features")
+
+lr = LogisticRegression(featuresCol="features", labelCol="label")
+
+pipeline = Pipeline(stages=[*indexers, *encoders, assembler, scaler, lr])
+
+paramGrid = (ParamGridBuilder()
+    .addGrid(lr.regParam, [0.0, 0.01, 0.1])
+    .addGrid(lr.elasticNetParam, [0.0, 0.5, 1.0])
+    .build())
+
+evalr = BinaryClassificationEvaluator(labelCol="label")
+
+cv = CrossValidator(estimator=pipeline, estimatorParamMaps=paramGrid, evaluator=evalr, numFolds=3)
+
+model = cv.fit(df)
+
+model.bestModel.write().overwrite().save(MODEL_DIR)
+print("Saved model to:", MODEL_DIR)
+```
+
+---
+
+### 6) GraphFrames (User‑Device‑Merchant Graph)
+
+> Cần thêm package tương thích: `--packages graphframes:graphframes:<VERSION>` (tuỳ bản Spark/Scala). Thay `<VERSION>` phù hợp môi trường.
+
+**spark/graph/fraud_graph.py**
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+# from graphframes import GraphFrame  # ensure proper package installed
+
+spark = (SparkSession.builder
+    .appName("fraud-graph")
+    .getOrCreate())
+
+# Load edges from curated transactions (user -> merchant, user -> device)
+curated = spark.read.parquet("hdfs://namenode:8020/curated/payments/")
+
+users = curated.select(col("user_id").alias("id")).distinct()
+merchants = curated.select(col("merchant_id").alias("id")).distinct()
+devices = curated.select(col("device_id").alias("id")).distinct()
+
+vertices = users.unionByName(merchants).unionByName(devices).distinct()
+
+u2m = curated.select(col("user_id").alias("src"), col("merchant_id").alias("dst")).distinct()
+u2d = curated.select(col("user_id").alias("src"), col("device_id").alias("dst")).distinct()
+edges = u2m.unionByName(u2d)
+
+# g = GraphFrame(vertices, edges)
+# cc = g.connectedComponents()
+# tri = g.triangleCount()
+# pr = g.pageRank(resetProbability=0.15, maxIter=10)
+
+# Example output sinks (disabled if graphframes missing)
+# cc.write.mode("overwrite").parquet("hdfs://namenode:8020/graph/cc/")
+# tri.write.mode("overwrite").parquet("hdfs://namenode:8020/graph/tri/")
+# pr.vertices.write.mode("overwrite").parquet("hdfs://namenode:8020/graph/pr/")
+
+print("Graph analytics job template ready.")
+```
+
+---
+
+### 7) Time‑series (moving averages, anomaly score)
+
+**spark/timeseries/ts_aggregations.py**
+
+```python
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import to_date, col, sum as f_sum, avg, stddev_samp
+
+spark = SparkSession.builder.appName("ts-aggregations").getOrCreate()
+
+curated = spark.read.parquet("hdfs://namenode:8020/curated/payments/")
+
+daily = (curated
+    .groupBy("merchant_id", to_date("event_date").alias("dt"))
+    .agg(f_sum("sum_amt").alias("sum_amt")))
+
+# 7‑day moving average & z‑score anomaly
+w = (Window.partitionBy("merchant_id").orderBy("dt").rowsBetween(-6, 0))
+with_ma = (daily
+    .withColumn("ma7", avg("sum_amt").over(w))
+    .withColumn("sd7", stddev_samp("sum_amt").over(w))
+    .withColumn("z", (col("sum_amt") - col("ma7")) / (col("sd7") + 1e-9)))
+
+with_ma.write.mode("overwrite").parquet("hdfs://namenode:8020/timeseries/daily_ma/")
+```
+
+---
+
+### 8) Great Expectations (Data Quality)
+
+**great_expectations/ge_check.py** (validation đơn giản cho batch)
+
+```python
+from great_expectations.dataset.sparkdf_dataset import SparkDFDataset
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder.appName("ge-validate").getOrCreate()
+df = spark.read.parquet("hdfs://namenode:8020/bronze/payments/")
+
+gx = SparkDFDataset(df)
+res = gx.expect_column_values_to_not_be_null("event_id")
+res &= gx.expect_column_values_to_be_between("amount", min_value=0)
+print("Validation results:", res)
+```
+
+---
+
+### 9) Spark Conf
+
+**spark/conf/spark-defaults.conf**
+
+```
+spark.sql.streaming.forceDeleteTempCheckpointLocation true
+spark.sql.adaptive.enabled true
+spark.sql.autoBroadcastJoinThreshold 50MB
+spark.serializer org.apache.spark.serializer.KryoSerializer
+spark.kryo.registrationRequired false
+```
+
+---
+
+### 10) Kubernetes Manifests (rút gọn, triển khai tham khảo)
+
+#### a) Spark Operator (CRD) — `k8s/spark-operator/spark-operator.yaml`
+
+> Sử dụng [spark-on-k8s-operator]. File này là placeholder cấu hình tối thiểu để cài operator (CRD, RBAC…).
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spark-operator
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spark-operator
+  namespace: spark-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: spark-operator}
+  template:
+    metadata:
+      labels: {app: spark-operator}
+    spec:
+      serviceAccountName: spark-operator-svc
+      containers:
+        - name: spark-operator
+          image: gcr.io/spark-operator/spark-operator:v1beta2-1.3.8-3.5.0
+          args:
+            - --enable-webhook=true
+            - --install-crds=true
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spark-operator-svc
+  namespace: spark-operator
+```
+
+#### b) Streaming SparkApplication — `k8s/spark-apps/streaming-transactions.yaml`
+
+```yaml
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: streaming-transactions
+  namespace: default
+spec:
+  type: Python
+  mode: cluster
+  image: docker.io/bitnami/spark:3.5.1
+  imagePullPolicy: IfNotPresent
+  mainApplicationFile: "local:///opt/spark/jobs/streaming_transactions.py"
+  sparkVersion: "3.5.1"
+  restartPolicy:
+    type: Always
+    onFailureRetries: 3
+    onFailureRetryInterval: 10
+    onSubmissionFailureRetries: 5
+    onSubmissionFailureRetryInterval: 20
+  sparkConf:
+    "spark.jars.packages": >-
+      org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,
+      com.datastax.spark:spark-cassandra-connector_2.12:3.5.0
+  driver:
+    cores: 1
+    memory: 2g
+    serviceAccount: spark
+    env:
+      - name: KAFKA_BOOTSTRAP
+        value: kafka:9092
+      - name: CHECKPOINT
+        value: hdfs://namenode:8020/checkpoints/streaming_tx
+      - name: OUT_BRONZE
+        value: hdfs://namenode:8020/bronze/payments/
+      - name: CS_KEYSPACE
+        value: payments
+      - name: CS_TABLE
+        value: agg_5m_by_merchant
+    volumeMounts:
+      - name: jobs
+        mountPath: /opt/spark/jobs
+  executor:
+    cores: 1
+    instances: 3
+    memory: 3g
+    volumeMounts:
+      - name: jobs
+        mountPath: /opt/spark/jobs
+  volumes:
+    - name: jobs
+      configMap:
+        name: spark-jobs
+```
+
+> **Lưu ý**: đặt code vào **ConfigMap** `spark-jobs` hoặc build image chứa code. (Trong thực tế nên đóng gói image chuẩn để đảm bảo dependency.)
+
+#### c) Batch SparkApplication — `k8s/spark-apps/batch-transformations.yaml`
+
+```yaml
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: batch-transformations
+spec:
+  type: Python
+  mode: cluster
+  image: docker.io/bitnami/spark:3.5.1
+  mainApplicationFile: "local:///opt/spark/jobs/batch_transformations.py"
+  sparkVersion: "3.5.1"
+  sparkConf:
+    "spark.sql.adaptive.enabled": "true"
+  driver:
+    cores: 1
+    memory: 2g
+    serviceAccount: spark
+  executor:
+    cores: 1
+    instances: 4
+    memory: 4g
+```
+
+#### d) Kafka (Strimzi, rút gọn) — `k8s/kafka/kafka-cluster.yaml`
+
+```yaml
+apiVersion: kafka.strimzi.io/v1beta2
+kind: Kafka
+metadata:
+  name: payments-kafka
+spec:
+  kafka:
+    version: 3.6.0
+    replicas: 3
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+    storage:
+      type: persistent-claim
+      size: 20Gi
+    config:
+      offsets.topic.replication.factor: 3
+      transaction.state.log.replication.factor: 3
+      transaction.state.log.min.isr: 2
+  zookeeper:
+    replicas: 3
+    storage:
+      type: persistent-claim
+      size: 10Gi
+```
+
+**topics.yaml**
+
+```yaml
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: payments.events
+  labels:
+    strimzi.io/cluster: payments-kafka
+spec:
+  partitions: 12
+  replicas: 3
+  config:
+    cleanup.policy: delete
+```
+
+#### e) Cassandra (StatefulSet rút gọn) — `k8s/cassandra/cassandra-statefulset.yaml`
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cassandra
+spec:
+  serviceName: cassandra
+  replicas: 3
+  selector:
+    matchLabels: { app: cassandra }
+  template:
+    metadata:
+      labels: { app: cassandra }
+    spec:
+      containers:
+        - name: cassandra
+          image: cassandra:4.1
+          ports:
+            - containerPort: 9042
+          env:
+            - name: CASSANDRA_CLUSTER_NAME
+              value: payments
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/cassandra
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 50Gi
+```
+
+**Schema CQL** (chạy một lần):
+
+```sql
+CREATE KEYSPACE IF NOT EXISTS payments WITH replication = {'class': 'NetworkTopologyStrategy', 'datacenter1': 3};
+CREATE TABLE IF NOT EXISTS payments.agg_5m_by_merchant (
+  merchant_id text,
+  status text,
+  window_start timestamp,
+  window_end timestamp,
+  cnt bigint,
+  sum_amount double,
+  n_users bigint,
+  PRIMARY KEY ((merchant_id), window_start, status)
+) WITH CLUSTERING ORDER BY (window_start ASC);
+```
+
+#### f) HDFS (tối giản) — `k8s/hdfs/*`
+
+> Có thể dùng chart/HDFS operator; YAML dưới dạng minh hoạ rút gọn.
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hdfs-namenode
+spec:
+  serviceName: hdfs-namenode
+  replicas: 1
+  selector:
+    matchLabels: { app: hdfs-nn }
+  template:
+    metadata:
+      labels: { app: hdfs-nn }
+    spec:
+      containers:
+        - name: namenode
+          image: ghcr.io/big-data-labs/hdfs-namenode:3.3
+          ports:
+            - containerPort: 8020
+            - containerPort: 9870
+          volumeMounts:
+            - name: data
+              mountPath: /hadoop/dfs/name
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 50Gi } }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hdfs-datanode
+spec:
+  serviceName: hdfs-datanode
+  replicas: 3
+  selector:
+    matchLabels: { app: hdfs-dn }
+  template:
+    metadata:
+      labels: { app: hdfs-dn }
+    spec:
+      containers:
+        - name: datanode
+          image: ghcr.io/big-data-labs/hdfs-datanode:3.3
+          ports:
+            - containerPort: 9864
+          volumeMounts:
+            - name: data
+              mountPath: /hadoop/dfs/data
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources: { requests: { storage: 100Gi } }
+```
+
+#### g) Ingestion API Deployment — `k8s/api/ingestion-api.yaml`
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestion-api
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: ingestion-api } }
+  template:
+    metadata:
+      labels: { app: ingestion-api }
+    spec:
+      containers:
+        - name: api
+          image: <your-registry>/ingestion-api:latest
+          env:
+            - { name: KAFKA_BOOTSTRAP, value: payments-kafka-kafka-bootstrap:9092 }
+          ports:
+            - { containerPort: 8080 }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingestion-api
+spec:
+  selector: { app: ingestion-api }
+  ports: [{ port: 80, targetPort: 8080 }]
+```
+
+#### h) Monitoring (rút gọn)
+
+* Prometheus `ServiceMonitor` cho Spark (JMX Exporter) + Kafka Exporter.
+* Grafana dashboards: Spark, Kafka, Cassandra, JVM.
+
+*(YAML cụ thể phụ thuộc stack hiện có; tuỳ chọn dùng Prometheus Operator.)*
+
+---
+
+### 11) Config & Env
+
+**config/application.yaml**
+
+```yaml
+kafka:
+  bootstrap: payments-kafka-kafka-bootstrap:9092
+  topic: payments.events
+
+hdfs:
+  uri: hdfs://namenode:8020
+
+cassandra:
+  host: cassandra
+  keyspace: payments
+  table_agg5m: agg_5m_by_merchant
+
+spark:
+  shuffle_partitions: 200
+```
+
+**config/.env.example**
+
+```
+KAFKA_BOOTSTRAP=payments-kafka-kafka-bootstrap:9092
+KAFKA_TOPIC=payments.events
+CHECKPOINT=hdfs://namenode:8020/checkpoints/streaming_tx
+OUT_BRONZE=hdfs://namenode:8020/bronze/payments/
+CS_KEYSPACE=payments
+CS_TABLE=agg_5m_by_merchant
+```
+
+---
+
+### 12) Tests
+
+**tests/test_spark_jobs.py** (local mode)
+
+```python
+import os
+from pyspark.sql import SparkSession
+
+def test_spark_session():
+    spark = (SparkSession.builder
+        .master("local[*]")
+        .appName("test")
+        .getOrCreate())
+    assert spark.version.startswith("3")
+```
+
+---
+
+## IV. Deployment Strategy
+
+1. **Kubernetes‑native Spark** qua **Spark Operator**. Đóng gói job thành image hoặc mount bằng ConfigMap (khuyến nghị: image).
+2. **Kafka** dùng Strimzi (HA, dễ cấu hình Topic/ACL).
+3. **HDFS**/S3‑compatible (MinIO) làm storage layer; ở đây minh hoạ HDFS.
+4. **Cassandra** làm serving store; key design cho idempotency.
+5. **Ingress** cho Ingestion API; autoscale (HPA) theo QPS.
+6. **CI/CD**: build images, push registry, apply k8s manifest (GitOps/ArgoCD).
+
+---
+
+## V. Monitoring Setup
+
+* **Spark**: JMX Exporter sidecar; scrape bởi Prometheus → Grafana dashboards (executor CPU/mem, batch duration, state store size, shuffle read/write, backpressure).
+* **Kafka**: Kafka Exporter metrics (under‑replicated partitions, consumer lag per group/topic/partition).
+* **Cassandra**: Exporter (latency, tombstones, compaction pending, read/write timeouts).
+* **Logs**: Loki/Promtail hoặc EFK; query theo `app`, `pod`, `stageId`.
+* **Alerts**:
+
+  * Lag tăng > ngưỡng,
+  * Streaming batch > p95,
+  * State store size tăng đột biến,
+  * Cassandra write timeout rate.
+
+---
+
+## VI. Lessons Learned (Templates & Filled Examples)
+
+> Mỗi bài học theo template yêu cầu.
+
+### Lesson 1: Handling Late‑Arriving Data
+
+#### Problem Description
+
+* Nguồn POS upload offline → sự kiện đến muộn 5‑30 phút.
+* Ảnh hưởng: double count hoặc miss aggregation.
+
+#### Approaches Tried
+
+* **A1**: Không dùng watermark → state phình to, out‑of‑memory.
+* **A2**: Watermark 10 phút → vẫn miss các sự kiện >10 phút.
+
+#### Final Solution
+
+* Watermark **20 phút** + **slide window 1 phút**, kết hợp **dedup by event_id** trước khi aggregate.
+* Kết quả: state ổn định, miss rate < 0.1%.
+
+#### Key Takeaways
+
+* Chọn watermark dựa trên SLA nguồn chậm nhất.
+
+### Lesson 2: Exactly‑once Processing
+
+#### Problem Description
+
+* Restart job gây ghi trùng bản ghi aggregate.
+
+#### Approaches Tried
+
+* **A1**: Append HDFS không idempotent.
+* **A2**: Upsert Cassandra theo batch id.
+
+#### Final Solution
+
+* Dùng **checkpoint** của Spark + **idempotent sink**: Cassandra upsert theo **(merchant_id, window_start, status)**.
+* Mỗi batch `foreachBatch` ghi idempotent.
+
+#### Key Takeaways
+
+* Exactly‑once thực tế = at‑least‑once + idempotent sink.
+
+### Lesson 3: Optimizing Spark Jobs
+
+#### Problem Description
+
+* Job batch chậm do shuffle nặng.
+
+#### Approaches Tried
+
+* **A1**: Tăng executor memory → marginal.
+* **A2**: Broadcast small dimension; **bucketing** curated theo `merchant_id`.
+
+#### Final Solution
+
+* **AQE** bật, **autoBroadcastJoinThreshold** phù hợp, **bucketing** + **sortBy** cho sort‑merge join nhanh hơn ~30%.
+
+#### Key Takeaways
+
+* Design layout dữ liệu (partition/bucket) quan trọng không kém cấu hình cluster.
+
+### Lesson 4: State Management in Streaming
+
+#### Problem Description
+
+* Cần giữ tỷ lệ lỗi rolling theo merchant.
+
+#### Approaches Tried
+
+* **A1**: window agg → không theo dõi xuyên batch.
+* **A2**: `mapGroupsWithState`.
+
+#### Final Solution
+
+* `mapGroupsWithState` + RocksDB state store provider; timeout processing time.
+
+#### Key Takeaways
+
+* Tránh lạm dụng state; lưu những gì tối thiểu cần cho cảnh báo.
+
+### Lesson 5: Data Storage Format & Partitioning
+
+#### Problem Description
+
+* Truy vấn theo ngày/merchant chậm.
+
+#### Approaches Tried
+
+* **A1**: Parquet trung tính.
+* **A2**: Partition by `event_date`; bucket by `merchant_id`.
+
+#### Final Solution
+
+* **Partition pruning** mạnh; scan giảm >60%.
+
+#### Key Takeaways
+
+* Chọn **partition** theo trường lọc phổ biến; bucket cho join.
+
+### Lesson 6: Caching & Persistence
+
+#### Problem Description
+
+* Dùng `.cache()` bừa bãi → memory pressure.
+
+#### Approaches Tried
+
+* **A1**: Cache mọi intermediate.
+* **A2**: Cache selective + unpersist.
+
+#### Final Solution
+
+* Cache chỉ dataset reuse >1 lần, kiểm tra `storageLevel` và `explain()`.
+
+#### Key Takeaways
+
+* Cache là con dao hai lưỡi.
+
+### Lesson 7: Metrics & RCA
+
+#### Problem Description
+
+* Spike latency không rõ nguyên nhân.
+
+#### Approaches Tried
+
+* **A1**: Chỉ xem driver log.
+* **A2**: Export Spark metrics + Kafka lag.
+
+#### Final Solution
+
+* Dashboard correlates: tăng lag → tăng batch duration → tụt throughput. Điều chỉnh `maxOffsetsPerTrigger` & executor instances.
+
+#### Key Takeaways
+
+* **Observability first**: không đo thì không tối ưu được.
+
+### Lesson 8: Scaling Policies
+
+#### Problem Description
+
+* Giờ cao điểm QPS tăng x3.
+
+#### Approaches Tried
+
+* **A1**: Vertical scale.
+* **A2**: Horizontal (executor instances) + autoscaling.
+
+#### Final Solution
+
+* HPA dựa trên custom metrics (lag, batch time); nhân đôi executors trong giờ cao điểm.
+
+#### Key Takeaways
+
+* Scale ngang phù hợp workload streaming.
+
+### Lesson 9: Data Quality & Testing
+
+#### Problem Description
+
+* Null `event_id` gây dedup lỗi.
+
+#### Approaches Tried
+
+* **A1**: Validate ở batch.
+* **A2**: Validate ngay ingestion + GE batch.
+
+#### Final Solution
+
+* Pydantic validate ở API; GE kiểm tra ở bronze nightly.
+
+#### Key Takeaways
+
+* Shift‑left validation.
+
+### Lesson 10: Security & Governance
+
+#### Problem Description
+
+* Cần kiểm soát quyền đọc topic & dữ liệu PII.
+
+#### Approaches Tried
+
+* **A1**: Topic open.
+* **A2**: Kafka ACL + mask PII.
+
+#### Final Solution
+
+* Kafka ACL theo service account; mask/ tokenize PII trước khi lưu.
+
+#### Key Takeaways
+
+* Principle of least privilege + data minimization.
+
+### Lesson 11: Fault Tolerance
+
+#### Problem Description
+
+* Node failure làm mất executor.
+
+#### Approaches Tried
+
+* **A1**: Không cấu hình restart.
+* **A2**: Spark Operator restartPolicy.
+
+#### Final Solution
+
+* `restartPolicy` với backoff; checkpoint đảm bảo resume từ offset đúng.
+
+#### Key Takeaways
+
+* Luôn dựa vào checkpoint/offset quản lý tiến trình.
+
+---
+
+## VII. Appendix
+
+### A. Tối ưu hoá & Kế hoạch chạy
+
+* **Partition pruning & bucketing**: như code batch.
+* **Caching strategies**: cache selective; `persist(StorageLevel.MEMORY_AND_DISK)` khi cần.
+* **Query optimization**: dùng `explain()` để kiểm tra sort‑merge vs broadcast; cài đặt `spark.sql.autoBroadcastJoinThreshold`.
+* **Resource allocation**: bắt đầu nhỏ, đo metrics, tăng dần; cân bằng CPU/mem/executors.
+
+### B. Exactly‑once Recap
+
+* Kafka → Spark: offset quản lý bởi checkpoint.
+* Sink HDFS: append + checkpoint đảm bảo mỗi batch ghi duy nhất.
+* Sink Cassandra: **idempotent upsert** với PK, chống ghi trùng khi retry.
+
+### C. Packages gợi ý khi submit
+
+```
+--packages \
+  org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,\
+  com.datastax.spark:spark-cassandra-connector_2.12:3.5.0,\
+  graphframes:graphframes:<MATCH_YOUR_SPARK_VERSION>
+```
+
+### D. So sánh nhanh Spark vs Alternatives
+
+* **Flink**: ưu thế streaming thuần, latency thấp; Spark mạnh batch + unified API; ở đây chọn Spark vì **Lambda** và ML/Graph ecosystem.
+
+---
+
+## VIII. Hướng dẫn chạy (rút gọn)
+
+1. Cài **Spark Operator**, **Strimzi Kafka**, **Cassandra**, **HDFS** trên K8s (theo manifest).
+2. Tạo **KafkaTopic** `payments.events`.
+3. Deploy **Ingestion API** và gửi dữ liệu mẫu (producer CLI).
+4. Apply **SparkApplication** cho streaming job.
+5. Chạy batch jobs định kỳ (CronJob + SparkApplication) để làm giàu curated.
+6. Chạy `train_risk_model.py`, `fraud_graph.py`, `ts_aggregations.py` theo lịch.
+7. Mở Grafana dashboard để theo dõi.
+
+> **Lưu ý**: Thực tế nên dùng Helm/ArgoCD, secrets (K8s Secret) cho credentials, và cấu hình network policies.
+
+---
+
+**Kết thúc tài liệu & mã minh hoạ.**
+
+---
+
+## IX. Missing files — added
+
+### `k8s/spark-apps/ml-train.yaml`
+
+```yaml
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: ml-train-risk-model
+  namespace: default
+spec:
+  type: Python
+  mode: cluster
+  image: docker.io/bitnami/spark:3.5.1
+  imagePullPolicy: IfNotPresent
+  mainApplicationFile: "local:///opt/spark/jobs/train_risk_model.py"
+  sparkVersion: "3.5.1"
+  restartPolicy:
+    type: OnFailure
+    onFailureRetries: 3
+    onFailureRetryInterval: 10
+    onSubmissionFailureRetries: 5
+    onSubmissionFailureRetryInterval: 20
+  sparkConf:
+    "spark.sql.adaptive.enabled": "true"
+    "spark.eventLog.enabled": "true"
+  driver:
+    cores: 1
+    memory: 2g
+    serviceAccount: spark
+    volumeMounts:
+      - name: jobs
+        mountPath: /opt/spark/jobs
+  executor:
+    cores: 1
+    instances: 3
+    memory: 3g
+    volumeMounts:
+      - name: jobs
+        mountPath: /opt/spark/jobs
+  volumes:
+    - name: jobs
+      configMap:
+        name: spark-jobs
+```
+
+### `k8s/kafka/strimzi-operator.yaml`
+
+> Minimal Strimzi **Cluster Operator** deployment (demo). In production, apply official CRDs/templates from Strimzi release.
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kafka
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: strimzi-cluster-operator
+  namespace: kafka
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: strimzi-cluster-operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin   # DEMO: broad permissions; tighten in real env
+subjects:
+  - kind: ServiceAccount
+    name: strimzi-cluster-operator
+    namespace: kafka
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: strimzi-cluster-operator
+  namespace: kafka
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      name: strimzi-cluster-operator
+  template:
+    metadata:
+      labels:
+        name: strimzi-cluster-operator
+    spec:
+      serviceAccountName: strimzi-cluster-operator
+      containers:
+        - name: strimzi-cluster-operator
+          image: quay.io/strimzi/operator:0.39.0
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: STRIMZI_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: STRIMZI_OPERATION_TIMEOUT_MS
+              value: "300000"
+            - name: STRIMZI_FEATURE_GATES
+              value: "+UseStrimziPodSets,+LeaderElection"
+```
+
+### `k8s/hdfs/namenode-statefulset.yaml`
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hdfs-namenode
+  labels: { app: hdfs-nn }
+spec:
+  selector: { app: hdfs-nn }
+  ports:
+    - name: rpc
+      port: 8020
+      targetPort: 8020
+    - name: http
+      port: 9870
+      targetPort: 9870
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hdfs-namenode
+spec:
+  serviceName: hdfs-namenode
+  replicas: 1
+  selector:
+    matchLabels: { app: hdfs-nn }
+  template:
+    metadata:
+      labels: { app: hdfs-nn }
+    spec:
+      containers:
+        - name: namenode
+          image: ghcr.io/big-data-labs/hdfs-namenode:3.3
+          ports:
+            - containerPort: 8020
+            - containerPort: 9870
+          volumeMounts:
+            - name: data
+              mountPath: /hadoop/dfs/name
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 50Gi
+```
+
+### `k8s/hdfs/datanode-statefulset.yaml`
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: hdfs-datanode
+  labels: { app: hdfs-dn }
+spec:
+  clusterIP: None
+  selector: { app: hdfs-dn }
+  ports:
+    - name: http
+      port: 9864
+      targetPort: 9864
+    - name: data
+      port: 9866
+      targetPort: 9866
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hdfs-datanode
+spec:
+  serviceName: hdfs-datanode
+  replicas: 3
+  selector:
+    matchLabels: { app: hdfs-dn }
+  template:
+    metadata:
+      labels: { app: hdfs-dn }
+    spec:
+      containers:
+        - name: datanode
+          image: ghcr.io/big-data-labs/hdfs-datanode:3.3
+          ports:
+            - containerPort: 9864
+            - containerPort: 9866
+          volumeMounts:
+            - name: data
+              mountPath: /hadoop/dfs/data
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 100Gi
+```
+
+### `monitoring/prometheus.yaml`
+
+> Uses **Prometheus Operator** CRDs (install operator first). Creates a Prometheus instance scraping any `ServiceMonitor` in `monitoring` ns.
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+---
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  name: k8s
+  namespace: monitoring
+spec:
+  replicas: 1
+  serviceAccountName: prometheus
+  serviceMonitorSelector: {}
+  podMonitorSelector: {}
+  resources:
+    requests:
+      memory: 400Mi
+  retention: 7d
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  type: ClusterIP
+  selector:
+    prometheus: k8s
+  ports:
+    - name: web
+      port: 9090
+      targetPort: 9090
+```
+
+### `monitoring/grafana.yaml`
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: monitoring
+  labels:
+    grafana_datasource: "1"
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        access: proxy
+        url: http://prometheus.monitoring.svc:9090
+        isDefault: true
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: grafana }
+  template:
+    metadata:
+      labels: { app: grafana }
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.1.0
+          ports:
+            - containerPort: 3000
+          env:
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-admin
+                  key: password
+          volumeMounts:
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+      volumes:
+        - name: datasources
+          configMap:
+            name: grafana-datasources
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grafana-admin
+  namespace: monitoring
+type: Opaque
+stringData:
+  password: admin123
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  type: ClusterIP
+  selector: { app: grafana }
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000
+```
+
+### `monitoring/servicemonitors.yaml`
+
+> ServiceMonitors for Spark (driver/executor with Prometheus JMX), Kafka (Strimzi exporter), and Cassandra (metrics exporter). Adjust labels/ports to your deployment.
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: spark-applications
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    any: true
+  selector:
+    matchExpressions:
+      - key: spark-role
+        operator: In
+        values: [driver, executor]
+  endpoints:
+    - port: metrics
+      interval: 15s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: strimzi-kafka
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    matchNames: [kafka]
+  selector:
+    matchLabels:
+      strimzi.io/kind: KafkaExporter
+  endpoints:
+    - port: http
+      interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: cassandra
+  namespace: monitoring
+spec:
+  namespaceSelector:
+    any: true
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cassandra-exporter
+  endpoints:
+    - port: prometheus
+      interval: 30s
+```
+
 
