@@ -1,0 +1,13 @@
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: payments.events
+  labels:
+    strimzi.io/cluster: payments-kafka
+spec:
+  partitions: 12
+  replicas: 3
+  config:
+    cleanup.policy: delete
+    retention.ms: 604800000  # 7 days
+    segment.bytes: 1073741824 # 1 GB

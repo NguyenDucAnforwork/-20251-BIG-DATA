@@ -1,0 +1,51 @@
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: streaming-transactions
+  namespace: default
+spec:
+  type: Python
+  mode: cluster
+  image: docker.io/bitnami/spark:3.5.1
+  imagePullPolicy: IfNotPresent
+  mainApplicationFile: "local:///opt/spark/jobs/streaming_transactions.py"
+  sparkVersion: "3.5.1"
+  restartPolicy:
+    type: Always
+      onFailureRetries: 3
+      onFailureRetryInterval: 10
+      onSubmissionFailureRetries: 5
+      onSubmissionFailureRetryInterval: 20
+  sparkConf:
+    "spark.jars.packages": >-
+      org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,
+      com.datastax.spark:spark-cassandra-connector_2.12:3.5.0
+  driver:
+    cores: 1
+    memory: 2g
+    serviceAccount: spark
+    env:
+      - name: KAFKA_BOOTSTRAP
+      value: kafka:9092
+      - name: CHECKPOINT
+      value: hdfs://namenode:8020/checkpoints/streaming_tx
+      - name: OUT_BRONZE
+      value: hdfs://namenode:8020/bronze/payments/
+      - name: CS_KEYSPACE
+      value: payments
+      - name: CS_TABLE
+      value: agg_5m_by_merchant
+    volumeMounts:
+      - name: jobs
+      mountPath: /opt/spark/jobs
+  executor:
+    cores: 1
+    instances: 3
+    memory: 3g
+    volumeMounts:
+      - name: jobs
+        mountPath: /opt/spark/jobs
+  volumes:
+    - name: jobs
+    configMap:
+      name: spark-jobs

@@ -1,0 +1,39 @@
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: ml-train-risk-model
+  namespace: default
+spec:
+  type: Python
+  mode: cluster
+  image: docker.io/bitnami/spark:3.5.1
+  imagePullPolicy: IfNotPresent
+  mainApplicationFile: "local:///opt/spark/jobs/train_risk_model.py"
+  sparkVersion: "3.5.1"
+  restartPolicy:
+    type: OnFailure
+    onFailureRetries: 3
+    onFailureRetryInterval: 10
+    onSubmissionFailureRetries: 5
+    onSubmissionFailureRetryInterval: 20
+  sparkConf:
+    "spark.sql.adaptive.enabled": "true"
+    "spark.eventLog.enabled": "true"
+  driver:
+    cores: 1
+    memory: 2g
+    serviceAccount: spark
+    volumeMounts:
+    - name: jobs
+      mountPath: /opt/spark/jobs
+  executor:
+    cores: 1
+    instances: 3
+    memory: 3g
+    volumeMounts:
+    - name: jobs
+      mountPath: /opt/spark/jobs
+  volumes:
+  - name: jobs
+    configMap:
+      name: spark-jobs

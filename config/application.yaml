@@ -1,0 +1,17 @@
+kafka:
+  bootstrap: payments-kafka-kafka-bootstrap:9092
+  topic: payments.events
+
+
+hdfs:
+  uri: hdfs://namenode:8020
+
+
+cassandra:
+  host: cassandra
+  keyspace: payments
+  table_agg5m: agg_5m_by_merchant
+
+
+spark:
+  shuffle_partitions: 200

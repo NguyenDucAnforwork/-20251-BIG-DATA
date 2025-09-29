@@ -1,0 +1,20 @@
+apiVersion: sparkoperator.k8s.io/v1beta2
+kind: SparkApplication
+metadata:
+  name: batch-transformations
+spec:
+  type: Python
+  mode: cluster
+  image: docker.io/bitnami/spark:3.5.1
+  mainApplicationFile: "local:///opt/spark/jobs/batch_transformations.py"
+  sparkVersion: "3.5.1"
+  sparkConf:
+    "spark.sql.adaptive.enabled": "true"
+  driver:
+    cores: 1
+    memory: 2g
+    serviceAccount: spark
+  executor:
+    cores: 1
+    instances: 4
+    memory: 4g

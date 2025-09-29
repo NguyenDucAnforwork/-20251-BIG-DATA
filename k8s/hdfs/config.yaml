@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hdfs-namenode
+spec:
+  serviceName: hdfs-namenode
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hdfs-nn
+  template:
+    metadata:
+      labels:
+        app: hdfs-nn
+    spec:
+      containers:
+      - name: namenode
+        image: ghcr.io/big-data-labs/hdfs-namenode:3.3
+        ports:
+        - containerPort: 8020
+        - containerPort: 9870
+        volumeMounts:
+        - name: data
+          mountPath: /hadoop/dfs/name
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 50Gi
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hdfs-datanode
+spec:
+  serviceName: hdfs-datanode
+  replicas: 3
+  selector:
+    matchLabels:
+      app: hdfs-dn
+  template:
+    metadata:
+      labels:
+        app: hdfs-dn
+    spec:
+      containers:
+      - name: datanode
+        image: ghcr.io/big-data-labs/hdfs-datanode:3.3
+        ports:
+        - containerPort: 9864
+        volumeMounts:
+        - name: data
+          mountPath: /hadoop/dfs/data
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 100Gi

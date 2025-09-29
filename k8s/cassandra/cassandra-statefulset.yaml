@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cassandra
+spec:
+  serviceName: cassandra
+  replicas: 3
+  selector:
+    matchLabels: {app: cassandra}
+  template:
+    metadata:
+      labels: {app: cassandra}
+    spec:
+      containers:
+        -name: cassandra
+        image: cassandra:4.1
+        ports:
+          - containerPort: 9042
+        env:
+          -name: CASSANDRA_CLUSTER_NAME
+          value: "PaymentsCluster"
+        volumeMounts:
+          - name: cassandra-data
+            mountPath: /var/lib/cassandra
+  volumeClaimTemplates:
+    - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+      requests:
+        storage: 50Gi

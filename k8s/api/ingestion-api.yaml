@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestion-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: ingestion-api
+  template:
+    metadata:
+      labels:
+        app: ingestion-api
+    spec:
+      containers:
+      - name: api
+        image: <your-registry>/ingestion-api:latest
+        env:
+        - name: KAFKA_BOOTSTRAP
+          value: payments-kafka-kafka-bootstrap:9092
+        ports:
+        - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ingestion-api
+spec:
+  selector:
+    app: ingestion-api
+  ports:
+  - port: 80
+    targetPort: 8080
